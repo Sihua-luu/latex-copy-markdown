@@ -196,7 +196,20 @@
   function wrapTex(raw, display) {
     var t = raw.trim();
     if (!t) return null;
-    if (/^\$[\s\S]+\$$/.test(t) || /^\\\([\s\S]+\\\)$/.test(t) || /^\\\[[\s\S]+\\\]$/.test(t)) return t;
+    // Already wrapped with $$...$$ — keep as display
+    if (/^\$\$[\s\S]+\$\$$/.test(t)) return t;
+    // Wrapped with \[...\] — convert to $$...$$
+    if (/^\\\[[\s\S]+\\\]$/.test(t)) return '$$' + t.slice(2, -2).trim() + '$$';
+    // Wrapped with $...$ (not $$) — upgrade to $$ if display mode
+    if (/^\$(?!\$)[\s\S]+(?<!\$)\$$/.test(t)) {
+      if (display) return '$' + t + '$'; // $..$ → $$..$$
+      return t;
+    }
+    // Wrapped with \(...\) — convert to $...$ or $$...$$
+    if (/^\\\([\s\S]+\\\)$/.test(t)) {
+      var inner = t.slice(2, -2).trim();
+      return display ? '$$' + inner + '$$' : '$' + inner + '$';
+    }
     return display ? '$$' + t + '$$' : '$' + t + '$';
   }
 
@@ -211,12 +224,54 @@
     try {
       if (el.getAttribute('data-lcm-display') === '1') return true;
       if (el.getAttribute('display') === 'true' || el.getAttribute('display') === 'block') return true;
-      var dc = ['katex-display', 'MathJax_Display', 'MathJax_SVG_Display'];
+      if (el.getAttribute('data-display') === 'true' || el.getAttribute('data-display') === 'block') return true;
+
+      var dc = ['katex-display', 'MathJax_Display', 'MathJax_SVG_Display', 'math-display', 'display-math'];
       for (var i = 0; i < dc.length; i++) {
         if (el.classList && el.classList.contains(dc[i])) return true;
         if (el.parentElement && el.parentElement.classList && el.parentElement.classList.contains(dc[i])) return true;
       }
-      try { if (el.closest && el.closest('.katex-display,.MathJax_Display,.MathJax_SVG_Display')) return true; } catch (_) { }
+
+      // Walk up ancestors checking for display indicators
+      try {
+        var cur = el;
+        for (var d = 0; d < 5 && cur && cur !== document.body; d++) {
+          var cls = cur.className;
+          if (typeof cls === 'string' && /\bdisplay\b/i.test(cls)) return true;
+          if (cur.tagName && cur.tagName.toLowerCase() === 'mjx-container' &&
+              cur.getAttribute('display') === 'true') return true;
+          cur = cur.parentElement;
+        }
+      } catch (_) { }
+
+      // closest() with expanded selectors
+      try {
+        if (el.closest && el.closest(
+          '.katex-display,.MathJax_Display,.MathJax_SVG_Display,' +
+          'mjx-container[display="true"],.math-display,.display-math'
+        )) return true;
+      } catch (_) { }
+
+      // Heuristic: math element is the sole significant content of a block-level parent
+      try {
+        var parent = el.parentElement;
+        if (parent) {
+          var ptag = parent.tagName;
+          if (ptag === 'P' || ptag === 'DIV' || ptag === 'SECTION' ||
+              ptag === 'BLOCKQUOTE' || ptag === 'CENTER') {
+            var siblings = parent.childNodes;
+            var significantCount = 0;
+            for (var si = 0; si < siblings.length; si++) {
+              var sib = siblings[si];
+              if (sib === el) { significantCount++; continue; }
+              if (sib.nodeType === 3 && !sib.textContent.trim()) continue;
+              significantCount++;
+            }
+            if (significantCount <= 1) return true;
+          }
+        }
+      } catch (_) { }
+
     } catch (_) { }
     return false;
   }
@@ -412,6 +467,111 @@
     } catch (_) { }
   }
 
+  // ─── Text-based LaTeX scanner ─────────────────────────────────────────
+  // Detects LaTeX formulas rendered as plain text (e.g. Google AI Overview)
+
+  var SKIP_TAGS = { SCRIPT: 1, STYLE: 1, TEXTAREA: 1, INPUT: 1, NOSCRIPT: 1, CODE: 1, PRE: 1 };
+
+  function scanTextFormulas() {
+    try {
+      var walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null, false
+      );
+      var textNodes = [];
+      var node;
+      while (node = walker.nextNode()) {
+        var text = node.textContent;
+        if (!text || text.length < 3) continue;
+        var par = node.parentElement;
+        if (!par) continue;
+        if (par.hasAttribute(PROCESSED)) continue;
+        if (par.getAttribute('data-lcm-inline-formula')) continue;
+        if (SKIP_TAGS[par.tagName]) continue;
+
+        // Check for LaTeX delimiter patterns
+        if (/\\\(.+?\\\)/.test(text) || /\\\[[\s\S]+?\\\]/.test(text) ||
+            /\$\$[\s\S]+?\$\$/.test(text) ||
+            /(?<!\$)\$(?!\$)(?!\s)[^$\n]+?(?<!\s)\$(?!\$)/.test(text)) {
+          textNodes.push(node);
+        }
+      }
+      // Process in reverse to avoid invalidating references
+      for (var i = textNodes.length - 1; i >= 0; i--) {
+        wrapLatexInText(textNodes[i]);
+      }
+    } catch (_) { }
+  }
+
+  function wrapLatexInText(textNode) {
+    try {
+      var text = textNode.textContent;
+      var parent = textNode.parentNode;
+      if (!parent) return;
+
+      // Skip if ancestor is already processed
+      var anc = parent;
+      while (anc && anc !== document.body) {
+        if (anc.hasAttribute(PROCESSED)) return;
+        anc = anc.parentElement;
+      }
+
+      // Combined regex: match $$...$$, \[...\], \(...\), $...$
+      // Order matters: $$ before $
+      var combinedRe = /(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(?<!\$)\$(?!\$)(?!\s)[^$\n]+?(?<!\s)\$(?!\$))/g;
+
+      var match;
+      var lastIndex = 0;
+      var fragments = [];
+      var hasMatch = false;
+
+      while ((match = combinedRe.exec(text)) !== null) {
+        var formula = match[0];
+
+        // For single-$ matches, verify content looks like LaTeX to avoid currency false positives
+        if (formula.charAt(0) === '$' && formula.charAt(1) !== '$') {
+          var inner = formula.slice(1, -1);
+          if (!looksLikeTex(inner)) continue;
+        }
+
+        hasMatch = true;
+
+        if (match.index > lastIndex) {
+          fragments.push(document.createTextNode(text.slice(lastIndex, match.index)));
+        }
+
+        var span = document.createElement('span');
+        span.textContent = formula;
+        span.setAttribute('data-lcm-inline-formula', '1');
+
+        // Convert to markdown-style LaTeX for copying
+        var latex;
+        if (/^\\\(/.test(formula)) {
+          latex = '$' + formula.slice(2, -2).trim() + '$';
+        } else if (/^\\\[/.test(formula)) {
+          latex = '$$' + formula.slice(2, -2).trim() + '$$';
+        } else {
+          latex = formula; // Already $...$ or $$...$$
+        }
+
+        attach(span, latex);
+        fragments.push(span);
+        lastIndex = match.index + match[0].length;
+      }
+
+      if (!hasMatch) return;
+
+      if (lastIndex < text.length) {
+        fragments.push(document.createTextNode(text.slice(lastIndex)));
+      }
+
+      var frag = document.createDocumentFragment();
+      for (var fi = 0; fi < fragments.length; fi++) {
+        frag.appendChild(fragments[fi]);
+      }
+      parent.replaceChild(frag, textNode);
+    } catch (_) { }
+  }
+
   // ─── DOM walk ──────────────────────────────────────────────────────────────
 
   var SELECTORS = [
@@ -438,6 +598,12 @@
     // Generic math containers
     '.equation', '.math-container', '.formula',
     '.math-tex', '.latex-formula',
+    // Display math patterns
+    '.math-display', '.display-math', '.math.display',
+    // Google AI Overview / SGE
+    '.wDYxhc math', '.co8aDb math', '.IZ6rdc math',
+    '.wDYxhc [data-mathml]', '.co8aDb [data-mathml]',
+    '.wDYxhc mjx-container', '.co8aDb mjx-container',
   ];
 
   function collectElements() {
@@ -534,6 +700,9 @@
           if (src) attach(el, src);
         } catch (_) { }
       }
+
+      // Scan for LaTeX formulas in plain text (Google AI Overview, etc.)
+      scanTextFormulas();
     } catch (_) { }
   }
 
