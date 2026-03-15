@@ -49,6 +49,9 @@
   function execCopy(text, mx, my) {
     try {
       if (!document.body) return;
+      var prevFocus = document.activeElement;
+      var prevSel = window.getSelection();
+      var savedRange = prevSel && prevSel.rangeCount > 0 ? prevSel.getRangeAt(0).cloneRange() : null;
       var ta = document.createElement('textarea');
       ta.value = text;
       ta.setAttribute('style', 'position:fixed;top:-9999px;left:-9999px;opacity:0');
@@ -56,6 +59,17 @@
       ta.focus(); ta.select();
       var ok = document.execCommand('copy');
       ta.remove();
+      // Restore previous focus and selection
+      if (prevFocus && prevFocus.focus) {
+        try { prevFocus.focus(); } catch (_) { }
+      }
+      if (savedRange) {
+        try {
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(savedRange);
+        } catch (_) { }
+      }
       showToast(mx, my, ok ? 'Copied!' : 'Failed', ok);
     } catch (_) {
       showToast(mx, my, 'Failed', false);
@@ -427,6 +441,7 @@
 
   function attach(el, src) {
     if (!src || el.hasAttribute(PROCESSED)) return;
+    if (isInsideEditable(el)) return;
     el.setAttribute(PROCESSED, '1');
     el.setAttribute('data-lcm-source', src);
 
@@ -472,6 +487,15 @@
 
   var SKIP_TAGS = { SCRIPT: 1, STYLE: 1, TEXTAREA: 1, INPUT: 1, NOSCRIPT: 1, CODE: 1, PRE: 1 };
 
+  function isInsideEditable(el) {
+    var cur = el;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      if (cur.isContentEditable) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
   function scanTextFormulas() {
     try {
       var walker = document.createTreeWalker(
@@ -487,6 +511,7 @@
         if (par.hasAttribute(PROCESSED)) continue;
         if (par.getAttribute('data-lcm-inline-formula')) continue;
         if (SKIP_TAGS[par.tagName]) continue;
+        if (isInsideEditable(par)) continue;
 
         // Check for LaTeX delimiter patterns
         if (/\\\(.+?\\\)/.test(text) || /\\\[[\s\S]+?\\\]/.test(text) ||
