@@ -87,12 +87,50 @@
   }
 
   // ─── Copy ──────────────────────────────────────────────────────────────────
+  //
+  // Strategy (in order):
+  //   1. Synchronous execCommand('copy') + intercepted `copy` event.
+  //      Runs inside the user gesture, never moves focus/selection (caret-safe),
+  //      and works even when the async Clipboard API is blocked
+  //      (unfocused document, Permissions-Policy in iframes, etc.).
+  //   2. navigator.clipboard.writeText (async).
+  //   3. Hidden-textarea execCommand fallback (last resort, may move focus).
+
+  function copyViaCopyEvent(text) {
+    let done = false;
+    const onCopy = (ev) => {
+      try {
+        ev.clipboardData.setData('text/plain', text);
+        ev.preventDefault();
+        // This copy event was triggered by us — keep page copy handlers
+        // (e.g. "append source link" scripts) from overwriting our data.
+        ev.stopImmediatePropagation();
+        done = true;
+      } catch (err) { warn('copy event handler failed', err); }
+    };
+    window.addEventListener('copy', onCopy, true);
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      warn('execCommand(copy) threw', err);
+    } finally {
+      window.removeEventListener('copy', onCopy, true);
+    }
+    return done;
+  }
 
   function copyText(text, mx, my) {
+    if (!text) { showToast(mx, my, 'Failed', false); return; }
+
+    if (copyViaCopyEvent(text)) {
+      showToast(mx, my, 'Copied!', true);
+      return;
+    }
+
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text)
         .then(() => showToast(mx, my, 'Copied!', true))
-        .catch(() => execCopy(text, mx, my));
+        .catch((err) => { warn('clipboard.writeText failed', err); execCopy(text, mx, my); });
     } else {
       execCopy(text, mx, my);
     }
@@ -120,8 +158,9 @@
 
       const ta = document.createElement('textarea');
       ta.value = text;
+      ta.setAttribute('readonly', '');
       ta.setAttribute('style', 'position:fixed;top:-9999px;left:-9999px;opacity:0');
-      document.body.appendChild(ta);
+      (document.body || document.documentElement).appendChild(ta);
       ta.focus();
       ta.select();
       const ok = document.execCommand('copy');
@@ -606,13 +645,36 @@
     el.setAttribute('data-lcm-source', src);
   }
 
-  // Single delegated listener on document for all formula clicks.
-  // Uses BUBBLE phase (not capture) so editors receive the event first.
-  // Does NOT call stopPropagation — other handlers (editor focus management,
-  // framework event systems like React) must still see the event.
-  document.addEventListener('click', function (e) {
-    const el = e.target.closest('[' + PROCESSED + ']');
+  // Single delegated listener for all formula clicks.
+  //
+  // Registered in the CAPTURE phase on `window` so it runs before any page
+  // handler. In v2.1 this was a bubble-phase listener on `document`, which
+  // silently never fired on sites whose own click handlers call
+  // stopPropagation() (ChatGPT, Gemini, many React/Vue apps) — hover worked,
+  // but clicking did nothing.
+  //
+  // We still do NOT call stopPropagation(): editors and framework event
+  // systems must keep receiving the click (that was the v2.0 caret bug).
+  function getFormulaTarget(e) {
+    const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+    for (let i = 0; i < path.length; i++) {
+      const n = path[i];
+      if (n && n.nodeType === 1 && n.hasAttribute(PROCESSED)) return n;
+      if (n === document || n === window) break;
+    }
+    const t = e.target;
+    if (t && t.nodeType === 1 && t.closest) return t.closest('[' + PROCESSED + ']');
+    return null;
+  }
+
+  window.addEventListener('click', function (e) {
+    if (e.button !== 0) return;
+    const el = getFormulaTarget(e);
     if (!el) return;
+
+    // Let the user still select text inside a formula by dragging.
+    const sel = window.getSelection && window.getSelection();
+    if (sel && !sel.isCollapsed && el.contains(sel.anchorNode)) return;
 
     // Runtime editable check: the element may have been processed before
     // the parent became contenteditable (common in SPAs).
@@ -628,7 +690,7 @@
     el.classList.add('lcm-flash');
     setTimeout(() => el.classList.remove('lcm-flash'), 200);
     copyText(el.getAttribute('data-lcm-source'), e.clientX, e.clientY);
-  });
+  }, true);
 
   function updateStamped() {
     try {

@@ -45,7 +45,7 @@ content.css                   → hover highlight & toast host styles
 
 ### Architecture
 
-- **Event delegation** — a single bubble-phase `click` listener on `document` handles all formula clicks, instead of per-element listeners. This avoids memory leaks in SPAs and does not interfere with page event handlers.
+- **Event delegation** — a single capture-phase `click` listener on `window` (no `stopPropagation`) handles all formula clicks, instead of per-element listeners. This avoids memory leaks in SPAs and does not interfere with page event handlers.
 - **Shadow DOM toast** — the "Copied!" notification lives inside a closed Shadow DOM, fully isolated from page styles.
 - **Fixed positioning** — toast uses `position: fixed` with `clientX/clientY`, immune to CSS transforms and scroll offsets.
 - **Editor protection** — `isInsideEditable()` checks both at attach-time and at click-time, so formulas that dynamically enter editable areas (common in SPAs) are correctly skipped.
@@ -69,6 +69,12 @@ content.css                   → hover highlight & toast host styles
 ```
 
 ## Changelog
+
+### v2.2
+
+- **Fix: clicking a formula did nothing on many sites** — the delegated click listener is now registered in the capture phase on `window` (still without `stopPropagation`). In v2.1 it was a bubble-phase listener on `document`, so any page handler calling `stopPropagation()` (ChatGPT, Gemini, many React/Vue apps) swallowed the click: hover highlight worked, but nothing was copied and no toast appeared.
+- **Copy: caret-safe synchronous path first** — copies via `execCommand('copy')` + an intercepted `copy` event (no focus or selection change), then falls back to `navigator.clipboard.writeText`, then the hidden-textarea method. Page `copy` handlers can no longer overwrite the copied LaTeX.
+- **Shadow DOM targets** — clicks are resolved through `composedPath()`, so formulas inside shadow roots are found reliably.
 
 ### v2.1
 
